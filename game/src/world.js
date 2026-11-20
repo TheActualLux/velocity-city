@@ -1,124 +1,115 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// The world: the city plus everything alive in it, and the one fixed-step update that advances
+// them all in a fixed order. Nothing here reads the clock or Math.random, so a seed and a list
+// of controls always replay the same way (that is what the screenshot scenes rely on).
+import { CITY, TIME } from './config.js';
+import { createRng, deriveSeed } from './rng.js';
+import { blockAtIndex, generateCity } from './city.js';
+import { createPlayer, updatePlayer } from './player.js';
+import { populateAround, recyclePopulation, scarePedestrians, updatePedestrians, updateTraffic } from './npc.js';
+import { dispatchPolice, updatePolice } from './police.js';
+import { updateBullets, updateCarDamage } from './combat.js';
+import { updateParticles } from './particles.js';
+import { updateBoats, updateGulls } from './ambient.js';
+import { updateLooseCars } from './vehicle.js';
+import { createWantedState, updateWanted } from './wanted.js';
+import { createMissionState, updateMission } from './missions.js';
+import { createCamera, snapCamera, startCameraPan, updateCamera } from './camera.js';
+import { idleControls } from './input.js';
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
-
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
-
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+/** Where a new game starts: the west sidewalk of a Mercado block near the beach. */
+export function playerStartPoint(city) {
+  const b = blockAtIndex(city, 1, 2);
+  return { x: b.x0 + CITY.sidewalk / 2, y: (b.y0 + b.y1) / 2 };
 }
 
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
+function parkedCarRecord(world, p) {
+  return {
+    id: world.nextId++, x: p.x, y: p.y, angle: p.angle, speed: 0, model: p.model, length: p.model.length, width: p.model.width,
+    color: p.color, health: 100, burning: 0, wrecked: false, parked: true, police: false, active: true, hitFlash: 0, smokeTimer: 0, braking: false,
+  };
+}
+
+/** The downtown avenue pan the title screen runs behind its text. */
+export function titlePan(city) {
+  const road = city.vroads[CITY.avenueCols[1]];
+  const y0 = city.hroads[CITY.downtown.j + 2].y;
+  const y1 = city.hroads[CITY.downtown.j - 2].y;
+  return { from: { x: road.x + 60, y: y0 }, to: { x: road.x + 140, y: y1 }, seconds: 90, zoom: 0.84 };
+}
+
+/** Build a world from a seed, sitting on the title screen. */
+export function createWorld(seed) {
+  const city = generateCity(seed);
+  const start = playerStartPoint(city);
+  const world = {
+    seed, city, rng: createRng(deriveSeed(seed, 'sim')), mode: 'title', time: 0, clock: 18.2, clockRunning: true,
+    player: createPlayer(start.x, start.y), cars: [], parked: [], peds: [], bullets: [], particles: [], decals: [],
+    gulls: [], boats: [], alarms: [], sounds: [], missionEvents: [], skids: [], skidHead: 0,
+    wanted: createWantedState(), mission: createMissionState(), camera: createCamera(start.x, start.y),
+    toast: null, nextId: 1, nextDispatch: 0, nextRoadblock: 0,
+  };
+  world.parked = city.parked.map((p) => parkedCarRecord(world, p));
+  const pan = titlePan(city);
+  startCameraPan(world.camera, pan.from, pan.to, pan.seconds, pan.zoom);
+  populateAround(world, pan.from.x, pan.from.y);
+  return world;
+}
+
+/** Leave the title: put the player in the street, start the clock at mid-morning, fill the streets around them. */
+export function startPlaying(world, x, y, hour = TIME.start) {
+  const p = world.player;
+  const start = playerStartPoint(world.city);
+  p.x = x ?? start.x;
+  p.y = y ?? start.y;
+  p.active = true;
+  p.aimX = p.x;
+  p.aimY = p.y - 60;
+  p.lookX = null;
+  p.lookY = null;
+  world.mode = 'play';
+  world.clock = hour;
+  world.camera.mode = 'follow';
+  world.camera.pan = null;
+  world.camera.targetZoom = 1;
+  snapCamera(world.camera, p.x, p.y);
+  populateAround(world, p.x, p.y);
+}
+
+/** The point the population ring and the gulls follow. */
+export function worldFocus(world) {
+  return world.mode === 'play' ? world.player : world.camera;
+}
+
+/** Advance the whole world one fixed step. */
+export function stepWorld(world, controls, dt) {
+  world.time += dt;
+  if (world.clockRunning) world.clock = (world.clock + TIME.hoursPerSecond * dt) % 24;
+  const playing = world.mode === 'play';
+  if (playing) updatePlayer(world, controls ?? idleControls(), dt);
+  updateTraffic(world, dt);
+  updateLooseCars(world, dt);
+  if (playing) {
+    dispatchPolice(world);
+    updatePolice(world, dt);
   }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
-
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+  updatePedestrians(world, dt);
+  updateBullets(world, dt);
+  updateCarDamage(world, dt);
+  updateParticles(world, dt);
+  const focus = worldFocus(world);
+  updateGulls(world, focus.x, focus.y, dt);
+  updateBoats(world, focus.y, dt);
+  if (playing) {
+    updateWanted(world, dt);
+    updateMission(world, dt);
   }
-
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
+  recyclePopulation(world, focus.x, focus.y);
+  updateCamera(world.camera, world, dt);
+  for (const a of world.alarms) scarePedestrians(world, a.x, a.y, a.radius);
+  world.alarms.length = 0;
+  if (world.sounds.length > 48) world.sounds.splice(0, world.sounds.length - 48);
+  if (world.toast) {
+    world.toast.time -= dt;
+    if (world.toast.time <= 0) world.toast = null;
   }
-
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
-  }
-
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
-  }
-
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
-      }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
-      }
-    }
-    return events;
-  }
-
-  reset();
-  return { state, reset, step };
 }
